@@ -1,6 +1,7 @@
 import requests
 import openpyxl
 from model import Items
+from datetime import datetime
 
 class ParserWB:
     def __init__(self, query: str):
@@ -29,6 +30,7 @@ class ParserWB:
             _page += 1
             if response.status_code == 200:
                 data = response.json().get("data", {})
+                time = datetime.now()
 
                 if "products" in data and isinstance(data["products"], list) and data["products"]:
                     items_info = Items.model_validate(data)  # Обрабатываем все товары
@@ -84,6 +86,7 @@ class ParserWB:
             price = price // 100
             sheet.append([
                 product.id,
+                datetime.now(),
                 product.name,
                 product.brand,
                 price,
@@ -109,4 +112,5 @@ class ParserWB:
 
 
 if __name__ == "__main__":
-    ParserWB("шарф").parse()
+    quary = "шарф"
+    ParserWB(quary).parse()
