@@ -4,6 +4,9 @@ from model import Items
 from datetime import datetime
 from clickhouse_driver import Client
 import requests
+from typing import Optional, Dict, List, Tuple
+
+LAST_WRITE_TIMES = {}
 
 class ParserWB:
     def __init__(self, query: str):
@@ -19,7 +22,6 @@ class ParserWB:
                 settings={'connect_timeout': 10}
             )
             
-            # Тестовый запрос для проверки соединения
             test_result = self.client.execute('SELECT 1')
             print("Соединение с ClickHouse установлено успешно")
         
@@ -38,12 +40,6 @@ class ParserWB:
     def parse(self):
         _page = 1
         all_items = Items(products=[])
-        
-        # Проверяем структуру таблицы
-        # structure = self.client.execute("DESCRIBE TABLE wildberries.data")
-        # print("Структура таблицы:")
-        # for column in structure:
-        #     print(column)
 
         while _page < 61:
             params = {
@@ -84,10 +80,150 @@ class ParserWB:
                 print("Ошибка при загрузке данных")
             return all_items
 
+    def find_product_position(self, article: int, query: str) -> Optional[Dict]:
+        """
+        Ищет товар по артикулу в текущем запросе и возвращает его позицию и данные
+        Возвращает словарь с ключами: position, product_data
+        """
+        try:
+            parsed_data = self.parse()
+            if parsed_data:
+                for idx, product in enumerate(parsed_data.products):
+                    if product.id == article:
+                        return {
+                            'position': idx + 1,
+                            'product_data': self._extract_product_data(product)
+                        }
+            
+            print("Не нашли в текущем парсинге, ищем в базе данных")
+            return self._find_product_in_db(article, query)
+
+            
+        except Exception as e:
+            print(f"Ошибка при поиске товара {article}: {str(e)}")
+            return None
+
+    def _find_product_in_db(self, article: int, query: str) -> Optional[Dict]:
+        """
+        Ищет товар в ClickHouse по артикулу и запросу
+        Возвращает последнюю запись о товаре
+        """
+        query_sql = """
+        SELECT 
+            if (promotion = 'no promotion' or promotion = '',position,promoPosition) as position_with_promo,
+            name,
+            brand,
+            price,
+            number_of_feedbacks,
+            reviewRating,
+            promoTextCard,
+            created_at
+        FROM wildberries.data
+        WHERE articul = %(article)s AND query = %(query)s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        
+        try:
+            result = self._execute_query(query_sql, {'article': article, 'query': query})
+            if result:
+                position, name, brand, price, feedbacks, rating, promo_text, timestamp = result[0]
+                print("Товар найден и добавлен в отслеживание.")
+                return {
+                    'position': position,
+                    'product_data': {
+                        'name': name,
+                        'brand': brand,
+                        'price': price,
+                        'feedbacks': feedbacks,
+                        'rating': rating,
+                        'promo_text': promo_text,
+                        'last_update': timestamp
+                    }
+                }
+            return None
+        except Exception as e:
+            print(f"Ошибка при поиске товара в БД: {str(e)}")
+            return None
+
+    def get_product_history(self, article: int, query: str, days: int = 7) -> List[Dict]:
+        """
+        Возвращает историю позиций товара за указанное количество дней
+        """
+        query_sql = """
+
+        SELECT 
+            if (promotion = 'no promotion' or promotion = '',position,promoPosition) as position_with_promo,
+            price,
+            number_of_feedbacks,
+            created_at  
+        FROM wildberries.data
+        WHERE articul = %(article)s  AND query = %(query)s
+          AND created_at <= %(date_from)s
+        ORDER BY created_at
+        """
+        
+        date_from = datetime.now()
+        
+        try:
+            results = self._execute_query(
+                query_sql, 
+                {
+                    'article': article,
+                    'query': query,
+                    'date_from': date_from
+                }
+            )
+            
+            history = []
+            for row in results:
+                position, price, feedbacks, timestamp = row
+                history.append({
+                    'date': timestamp,
+                    'position': position,
+                    'price': price,
+                    'feedbacks': feedbacks
+                })
+            
+            return history
+        except Exception as e:
+            print(f"Ошибка при получении истории товара: {str(e)}")
+            return []
+
+
+    def _extract_product_data(self, product) -> Dict:
+        """Извлекает основные данные о товаре"""
+        price = product.sizes[0].get("price", {}).get("total", 0) // 100 if product.sizes else 0
+        logistics = product.sizes[0].get("price", {}).get("logistics", 0) if product.sizes else 0
+        
+        return {
+            'id': product.id,
+            'name': product.name if product.name else 'no name',
+            'brand': product.brand if product.brand else 'no brand',
+            'price': price,
+            'logistics_cost': logistics,
+            'rating': product.reviewRating if product.reviewRating else 0,
+            'feedbacks': product.feedbacks if product.feedbacks else 0,
+            'quantity': product.totalQuantity if product.totalQuantity else 0,
+            'promo_text': product.promoTextCard if product.promoTextCard else 'no promo',
+            'position': product.log.get("position") if product.log else -1,
+            'promo_position': product.log.get("promoPosition") if product.log else -1,
+            'colors': len(product.colors) if product.colors else 1
+        }
+    
     def __save_to_db(self, items: Items):
-        if not items or not items.products:
-            print("Нет данных для сохранения")
-            return False
+    
+        current_time = datetime.now()
+        print(LAST_WRITE_TIMES)
+        if self.query in LAST_WRITE_TIMES:
+            last_write_time = LAST_WRITE_TIMES[self.query]
+            print(f"Текущее время: {current_time}, Время последней записи: {last_write_time}")
+            
+            if (current_time - last_write_time).total_seconds() < 3598:
+                print(f"Данные по запросу '{self.query}' уже сохранялись менее часа назад. Пропускаем.")
+                return False
+        else:
+            print(f"Первая запись для запроса '{self.query}'")
         
         data_to_insert = []
         for i, product in enumerate(items.products): 
@@ -115,7 +251,7 @@ class ParserWB:
                 product.promoTextCard if product.promoTextCard else 'no promo',
                 product.log.get("cpm") if product.log else 0,
                 product.log.get("promoPosition") if product.log else -1,
-                product.log.get("position") if product.log else i,
+                product.log.get("position") if product.log else i+1,
                 len(product.colors) if product.colors else 0
             ))
         try:
@@ -124,161 +260,14 @@ class ParserWB:
                 """INSERT INTO wildberries.data VALUES""",
                 data_to_insert,types_check=True
             )
+            LAST_WRITE_TIMES[self.query] = current_time
+            print(LAST_WRITE_TIMES)
             return True
         except Exception as e:
             print(f"Ошибка при вставке данных: {str(e)}")
             return False
-        #     data_to_insert.append((
-        #         product.id,
-        #         self.query,
-        #         datetime.now(),
-        #         product.name,
-        #         product.brand or "no brand",
-        #         price,
-        #         logistics,
-        #         product.reviewRating,
-        #         product.feedbacks,
-        #         product.totalQuantity,
-        #         product.viewFlags,
-        #         product.pics,
-        #         product.supplierFlags,
-        #         product.supplierRating,
-        #         product.dist or 0,
-        #         promotion,
-        #         tp,
-        #         product.promoTextCard or "no promoText",
-        #         cpm,
-        #         promoPosition,
-        #         position,
-        #         count_of_colors
-        #     ))
-
-        # insert_query = f"""
-        # INSERT INTO wildberries.data VALUES {data_to_insert}
-        # """
-        # return self._execute_query(insert_query)
-
-    
-    def __create_excel(self):
-        try:
-            workbook = openpyxl.load_workbook(self.filename_excel)
-        except FileNotFoundError:
-            workbook = openpyxl.Workbook()
-
-        if self.query not in workbook.sheetnames:
-            sheet = workbook.create_sheet(title=self.query)
-            headers = ["id","время создания", "название", "бренд", "цена", "стоимость_доставки", "рейтинг", "количество_отзывов", "в_наличии","количество_просмотров","количество_картинок","уровень_продавца","рейтинг_продавца","расстояние_до_товара","участвует_в_продвижении?","тип_рекламы","рекламный_слоган","рекламная ставка", "промо_место","место_без_продвижения", "количество_цветов","запрос"]
-            sheet.append(headers)
-        else:
-            sheet = workbook[self.query]
-
-        workbook.save(self.filename_excel)
-
-    def __save_excel(self, items: Items):
-        workbook = openpyxl.load_workbook(self.filename_excel)
-        sheet = workbook[self.query]
-
-        for i, product in enumerate(items.products):
-            price = product.sizes[0].get("price", {}).get("total")
-            logistics = product.sizes[0].get("price", {}).get("logistics")
-
-            promotion = None
-            cpm = None
-            promoPosition = None
-            position = i
-            tp = None
-            count_of_colors = None
-
-            if product.log is not None:
-                promotion = product.log.get("promotion")
-                cpm = product.log.get("cpm")
-                promoPosition = product.log.get("promoPosition")
-                position = product.log.get("position")
-                tp = product.log.get("tp")
-            if product.colors is not None:
-                count_of_colors = len(product.colors)
-
-            # print(product)
-            price = price // 100
-            sheet.append([
-                product.id,
-                (datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
-                product.name,
-                product.brand,
-                price,
-                logistics,
-                product.reviewRating,
-                product.feedbacks,
-                product.totalQuantity,
-                product.viewFlags,
-                product.pics,
-                product.supplierFlags,
-                product.supplierRating,
-                product.dist,
-                promotion,
-                tp,
-                product.promoTextCard,
-                cpm,
-                promoPosition,
-                position,
-                count_of_colors
-            ])
-        workbook.save(self.filename_excel)
-        print(f"В Excel записано товаров")
-
-    def __save_csv(self, items: Items):
-        with open(self.filename_csv, mode='a', newline='', encoding='utf-8') as csvfile:
-            csv_writer = csv.writer(csvfile)
-
-            for i, product in enumerate(items.products):
-                price = product.sizes[0].get("price", {}).get("total")
-                logistics = product.sizes[0].get("price", {}).get("logistics")
-
-                promotion = None
-                cpm = None
-                promoPosition = None
-                position = i
-                tp = None
-                count_of_colors = None
-
-                if product.log is not None:
-                    promotion = product.log.get("promotion")
-                    cpm = product.log.get("cpm")
-                    promoPosition = product.log.get("promoPosition")
-                    position = product.log.get("position")
-                    tp = product.log.get("tp")
-                if product.colors is not None:
-                    count_of_colors = len(product.colors)
-
-                price = price // 100 if price is not None else None
-                csv_writer.writerow([
-                    product.id,
-                    (datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
-                    product.name,
-                    product.brand,
-                    price,
-                    logistics,
-                    product.reviewRating,
-                    product.feedbacks,
-                    product.totalQuantity,
-                    product.viewFlags,
-                    product.pics,
-                    product.supplierFlags,
-                    product.supplierRating,
-                    product.dist,
-                    promotion,
-                    tp,
-                    product.promoTextCard,
-                    cpm,
-                    promoPosition,
-                    position,
-                    count_of_colors,
-                    self.query
-                ])
-            print(f"В CSV записаны товары")
-
 
 if __name__ == "__main__":
     quary = "шарф"
     print("Парсим данные...")
-    ParserWB(quary).parse()
+    # ParserWB(quary).parse()
