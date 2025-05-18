@@ -5,14 +5,18 @@ from datetime import datetime
 from clickhouse_driver import Client
 import requests
 from typing import Optional, Dict, List, Tuple
+import logging
 
 LAST_WRITE_TIMES = {}
 
 class ParserWB:
     def __init__(self, query: str):
+        # Используем основной логгер бота
+        self.logger = logging.getLogger('WBTrackerBot')
         self.query = query
         self.filename_excel = f"{query}.xlsx"
         self.filename_csv = f"{query}.csv"
+        
         try:
             self.client = Client(
                 host='195.133.194.116',
@@ -23,23 +27,27 @@ class ParserWB:
             )
             
             test_result = self.client.execute('SELECT 1')
-            print("Соединение с ClickHouse установлено успешно")
+            self.logger.info(f"[ParserWB] Соединение с ClickHouse установлено успешно (запрос: '{query}')")
         
         except Exception as e:
-            print(f"Ошибка подключения к ClickHouse: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка подключения к ClickHouse: {str(e)}", exc_info=True)
             raise
 
     def _execute_query(self, query, params=None):
         """Выполняет SQL-запрос к ClickHouse через clickhouse-driver"""
         try:
-            return self.client.execute(query, params)
+            self.logger.debug(f"[ParserWB] Выполнение запроса: {query[:100]}... (params: {params})")
+            result = self.client.execute(query, params)
+            self.logger.debug("[ParserWB] Запрос выполнен успешно")
+            return result
         except Exception as e:
-            print(f"Ошибка выполнения запроса: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка выполнения запроса: {str(e)}", exc_info=True)
             return None
 
     def parse(self):
         _page = 1
         all_items = Items(products=[])
+        self.logger.info(f"[ParserWB] Начало парсинга запроса: '{self.query}'")
 
         while _page < 61:
             params = {
@@ -56,6 +64,7 @@ class ParserWB:
                 'suppressSpellcheck': 'false',
             }
 
+            self.logger.debug(f"[ParserWB] Запрос страницы {_page} с параметрами: {params}")
             response = requests.get('https://search.wb.ru/exactmatch/ru/common/v9/search', params=params)
             _page += 1
             
@@ -65,20 +74,25 @@ class ParserWB:
                 if "products" in data and isinstance(data["products"], list) and data["products"]:
                     items_info = Items.model_validate(data)
                     all_items.products.extend(items_info.products)
-                    print(f"Прочитаны данные со страницы: {_page-1}")
+                    self.logger.info(f"[ParserWB] Прочитаны данные со страницы {_page-1}: {len(items_info.products)} товаров")
                 else:
-                    print("Список товаров пуст или отсутствует.")
+                    self.logger.warning(f"[ParserWB] Список товаров пуст или отсутствует на странице {_page-1}")
+                    break
             else:
-                print(f"Ошибка при запросе данных! Код: {response.status_code}")
+                self.logger.error(f"[ParserWB] Ошибка при запросе данных! Код: {response.status_code}")
+                break
         
         if all_items.products:
-            print(f"Загружаем {len(all_items.products)} записей в ClickHouse...")
+            self.logger.info(f"[ParserWB] Всего загружено {len(all_items.products)} товаров. Сохранение в ClickHouse...")
             result = self.__save_to_db(all_items)
             if result:
-                print(f"Успешно загружено {len(all_items.products)} записей")
+                self.logger.info(f"[ParserWB] Успешно загружено {len(all_items.products)} записей в ClickHouse")
             else:
-                print("Ошибка при загрузке данных")
+                self.logger.error("[ParserWB] Ошибка при загрузке данных в ClickHouse")
             return all_items
+        else:
+            self.logger.warning("[ParserWB] Не найдено ни одного товара по запросу")
+            return None
 
     def find_product_position(self, article: int, query: str) -> Optional[Dict]:
         """
@@ -86,21 +100,24 @@ class ParserWB:
         Возвращает словарь с ключами: position, product_data
         """
         try:
+            self.logger.info(f"[ParserWB] Поиск товара {article} по запросу '{query}'")
             parsed_data = self.parse()
+            
             if parsed_data:
                 for idx, product in enumerate(parsed_data.products):
                     if product.id == article:
+                        position = idx + 1
+                        self.logger.info(f"[ParserWB] Товар {article} найден на позиции {position}")
                         return {
-                            'position': idx + 1,
+                            'position': position,
                             'product_data': self._extract_product_data(product)
                         }
             
-            print("Не нашли в текущем парсинге, ищем в базе данных")
+            self.logger.warning(f"[ParserWB] Товар {article} не найден в текущем парсинге, поиск в БД")
             return self._find_product_in_db(article, query)
-
             
         except Exception as e:
-            print(f"Ошибка при поиске товара {article}: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка при поиске товара {article}: {str(e)}", exc_info=True)
             return None
 
     def _find_product_in_db(self, article: int, query: str) -> Optional[Dict]:
@@ -125,10 +142,12 @@ class ParserWB:
         """
         
         try:
+            self.logger.debug(f"[ParserWB] Поиск товара {article} в БД по запросу '{query}'")
             result = self._execute_query(query_sql, {'article': article, 'query': query})
+            
             if result:
                 position, name, brand, price, feedbacks, rating, promo_text, timestamp = result[0]
-                print("Товар найден и добавлен в отслеживание.")
+                self.logger.info(f"[ParserWB] Товар {article} найден в БД на позиции {position}")
                 return {
                     'position': position,
                     'product_data': {
@@ -141,9 +160,10 @@ class ParserWB:
                         'last_update': timestamp
                     }
                 }
+            self.logger.warning(f"[ParserWB] Товар {article} не найден в БД")
             return None
         except Exception as e:
-            print(f"Ошибка при поиске товара в БД: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка при поиске товара в БД: {str(e)}", exc_info=True)
             return None
 
     def get_product_history(self, article: int, query: str, days: int = 7) -> List[Dict]:
@@ -151,7 +171,6 @@ class ParserWB:
         Возвращает историю позиций товара за указанное количество дней
         """
         query_sql = """
-
         SELECT 
             if (promotion = 'no promotion' or promotion = '',position,promoPosition) as position_with_promo,
             price,
@@ -164,6 +183,7 @@ class ParserWB:
         """
         
         date_from = datetime.now()
+        self.logger.info(f"[ParserWB] Получение истории товара {article} за последние {days} дней")
         
         try:
             results = self._execute_query(
@@ -185,47 +205,73 @@ class ParserWB:
                     'feedbacks': feedbacks
                 })
             
+            self.logger.info(f"[ParserWB] Получено {len(history)} записей истории для товара {article}")
             return history
         except Exception as e:
-            print(f"Ошибка при получении истории товара: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка при получении истории товара: {str(e)}", exc_info=True)
             return []
-
 
     def _extract_product_data(self, product) -> Dict:
         """Извлекает основные данные о товаре"""
-        price = product.sizes[0].get("price", {}).get("total", 0) // 100 if product.sizes else 0
-        logistics = product.sizes[0].get("price", {}).get("logistics", 0) if product.sizes else 0
-        
-        return {
-            'id': product.id,
-            'name': product.name if product.name else 'no name',
-            'brand': product.brand if product.brand else 'no brand',
-            'price': price,
-            'logistics_cost': logistics,
-            'rating': product.reviewRating if product.reviewRating else 0,
-            'feedbacks': product.feedbacks if product.feedbacks else 0,
-            'quantity': product.totalQuantity if product.totalQuantity else 0,
-            'promo_text': product.promoTextCard if product.promoTextCard else 'no promo',
-            'position': product.log.get("position") if product.log else -1,
-            'promo_position': product.log.get("promoPosition") if product.log else -1,
-            'colors': len(product.colors) if product.colors else 1
-        }
+        try:
+            price = product.sizes[0].get("price", {}).get("total", 0) // 100 if product.sizes else 0
+            logistics = product.sizes[0].get("price", {}).get("logistics", 0) if product.sizes else 0
+            
+            data = {
+                'id': product.id,
+                'name': product.name if product.name else 'no name',
+                'brand': product.brand if product.brand else 'no brand',
+                'price': price,
+                'logistics_cost': logistics,
+                'rating': product.reviewRating if product.reviewRating else 0,
+                'feedbacks': product.feedbacks if product.feedbacks else 0,
+                'quantity': product.totalQuantity if product.totalQuantity else 0,
+                'promo_text': product.promoTextCard if product.promoTextCard else 'no promo',
+                'position': product.log.get("position") if product.log else -1,
+                'promo_position': product.log.get("promoPosition") if product.log else -1,
+                'colors': len(product.colors) if product.colors else 1
+            }
+            
+            self.logger.debug(f"[ParserWB] Извлечены данные товара {product.id}: {data}")
+            return data
+            
+        except Exception as e:
+            self.logger.error(f"[ParserWB] Ошибка при извлечении данных товара: {str(e)}", exc_info=True)
+            return {
+                'id': product.id,
+                'name': 'error',
+                'brand': 'error',
+                'price': 0,
+                'logistics_cost': 0,
+                'rating': 0,
+                'feedbacks': 0,
+                'quantity': 0,
+                'promo_text': 'error',
+                'position': -1,
+                'promo_position': -1,
+                'colors': 0
+            }
     
     def __save_to_db(self, items: Items):
-    
         current_time = datetime.now()
-        print(LAST_WRITE_TIMES)
+        self.logger.debug(f"[ParserWB] Проверка времени последней записи для запроса '{self.query}'")
+        
         if self.query in LAST_WRITE_TIMES:
             last_write_time = LAST_WRITE_TIMES[self.query]
-            print(f"Текущее время: {current_time}, Время последней записи: {last_write_time}")
+            time_diff = (current_time - last_write_time).total_seconds()
             
-            if (current_time - last_write_time).total_seconds() < 3598:
-                print(f"Данные по запросу '{self.query}' уже сохранялись менее часа назад. Пропускаем.")
+            if time_diff < 3598:
+                self.logger.warning(
+                    f"[ParserWB] Данные по запросу '{self.query}' уже сохранялись {time_diff:.0f} секунд назад. "
+                    "Пропускаем сохранение."
+                )
                 return False
         else:
-            print(f"Первая запись для запроса '{self.query}'")
+            self.logger.info(f"[ParserWB] Первая запись для запроса '{self.query}'")
         
         data_to_insert = []
+        self.logger.info(f"[ParserWB] Подготовка {len(items.products)} товаров для сохранения в БД")
+        
         for i, product in enumerate(items.products): 
             price = product.sizes[0].get("price", {}).get("total", 0) // 100
             logistics = product.sizes[0].get("price", {}).get("logistics", 0)
@@ -254,20 +300,33 @@ class ParserWB:
                 product.log.get("position") if product.log else i+1,
                 len(product.colors) if product.colors else 0
             ))
+        
         try:
-            # Вставляем данные одной операцией
+            self.logger.info(f"[ParserWB] Начало вставки {len(data_to_insert)} записей в ClickHouse")
             self.client.execute(
                 """INSERT INTO wildberries.data VALUES""",
-                data_to_insert,types_check=True
+                data_to_insert,
+                types_check=True
             )
+            
             LAST_WRITE_TIMES[self.query] = current_time
-            print(LAST_WRITE_TIMES)
+            self.logger.info(f"[ParserWB] Успешно сохранено {len(data_to_insert)} записей для запроса '{self.query}'")
             return True
+            
         except Exception as e:
-            print(f"Ошибка при вставке данных: {str(e)}")
+            self.logger.error(f"[ParserWB] Ошибка при вставке данных: {str(e)}", exc_info=True)
             return False
 
 if __name__ == "__main__":
-    quary = "шарф"
-    print("Парсим данные...")
-    # ParserWB(quary).parse()
+    # Настройка логирования при запуске напрямую (для тестирования)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('bot.log'),
+            logging.StreamHandler()
+        ]
+    )
+    query = "шарф"
+    parser = ParserWB(query)
+    parser.logger.info(f"[ParserWB] Запуск парсера для запроса: '{query}'")
